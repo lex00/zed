@@ -301,7 +301,7 @@ impl Column for DataType {
     }
 }
 
-pub(crate) struct ThreadsDatabase {
+pub struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
 }

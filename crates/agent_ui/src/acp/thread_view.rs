@@ -6,7 +6,7 @@ use acp_thread::{
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent::{DbThreadMetadata, NativeAgentServer, SharedThread};
+use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadsDatabase};
 use agent_client_protocol::{self as acp, PromptCapabilities};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
@@ -998,7 +998,7 @@ impl AcpThreadView {
         };
 
         let client = self.project.read(cx).client();
-        let history_store = self.history_store.clone();
+        let database_future = ThreadsDatabase::connect(cx);
         let session_id = thread.read(cx).id().clone();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -1012,11 +1012,8 @@ impl AcpThreadView {
 
             let db_thread = shared_thread.to_db_thread();
 
-            history_store
-                .update(&mut cx.clone(), |store, cx| {
-                    store.save_thread(session_id.clone(), db_thread, cx)
-                })
-                .await?;
+            let database = database_future.await.map_err(|err| anyhow!("{err}"))?;
+            database.save_thread(session_id.clone(), db_thread).await?;
 
             let thread_metadata = agent::DbThreadMetadata {
                 id: session_id,

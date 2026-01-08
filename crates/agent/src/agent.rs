@@ -1595,8 +1595,6 @@ impl TerminalHandle for AcpTerminalHandle {
 
 #[cfg(test)]
 mod internal_tests {
-    use crate::HistoryEntryId;
-
     use super::*;
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
     use fs::FakeFs;
@@ -1819,9 +1817,6 @@ mod internal_tests {
         )
         .await;
         let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
-        let text_thread_store =
-            cx.new(|cx| assistant_text_thread::TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let agent = NativeAgent::new(
             project.clone(),
             Templates::new(),
@@ -1854,7 +1849,16 @@ mod internal_tests {
             thread.set_summarization_model(Some(summary_model.clone()), cx);
         });
         cx.run_until_parked();
-        assert_eq!(history_entries(&history_store, cx), vec![]);
+
+        // Verify empty thread is not in database
+        let db_thread = cx
+            .update(|cx| ThreadsDatabase::connect(cx))
+            .await
+            .unwrap()
+            .load_thread(session_id.clone())
+            .await
+            .unwrap();
+        assert!(db_thread.is_none(), "Empty threads should not be saved");
 
         let send = acp_thread.update(cx, |thread, cx| {
             thread.send(
@@ -1915,14 +1919,22 @@ mod internal_tests {
             assert_eq!(agent.sessions.keys().cloned().collect::<Vec<_>>(), []);
         });
 
-        // Ensure the thread can be reloaded from disk.
+        // Ensure the thread was saved to the database.
+        let db_thread = cx
+            .update(|cx| ThreadsDatabase::connect(cx))
+            .await
+            .unwrap()
+            .load_thread(session_id.clone())
+            .await
+            .unwrap();
+        assert!(db_thread.is_some(), "Thread should be saved to database");
+        let db_thread = db_thread.unwrap();
         assert_eq!(
-            history_entries(&history_store, cx),
-            vec![(
-                HistoryEntryId::AcpThread(session_id.clone()),
-                format!("Explaining {}", path!("/a/b.md"))
-            )]
+            db_thread.title.as_ref(),
+            &format!("Explaining {}", path!("/a/b.md"))
         );
+
+        // Ensure the thread can be reloaded from disk.
         let acp_thread = agent
             .update(cx, |agent, cx| agent.open_thread(session_id.clone(), cx))
             .await
@@ -1942,18 +1954,6 @@ mod internal_tests {
                 "}
             )
         });
-    }
-
-    fn history_entries(
-        history: &Entity<HistoryStore>,
-        cx: &mut TestAppContext,
-    ) -> Vec<(HistoryEntryId, String)> {
-        history.read_with(cx, |history, _| {
-            history
-                .entries()
-                .map(|e| (e.id(), e.title().to_string()))
-                .collect::<Vec<_>>()
-        })
     }
 
     fn init_test(cx: &mut TestAppContext) {

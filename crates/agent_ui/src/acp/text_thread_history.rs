@@ -303,7 +303,10 @@ impl TextThreadHistory {
 
         cx.spawn(async move |this, cx| {
             for path in paths {
-                store.update(cx, |store, cx| store.delete_local(path, cx));
+                store
+                    .update(cx, |store, cx| store.delete_local(path, cx))
+                    .await
+                    .log_err();
             }
 
             this.update(cx, |this, cx| {

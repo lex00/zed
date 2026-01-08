@@ -4,7 +4,7 @@
 mod reliability;
 mod zed;
 
-use agent::{HistoryStore, SharedThread};
+use agent::{SharedThread, ThreadsDatabase};
 use agent_client_protocol;
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Error, Result};
@@ -844,19 +844,9 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     let workspace =
                         workspace::get_any_active_workspace(app_state.clone(), cx.clone()).await?;
 
-                    let (client, history_store) =
-                        workspace.update(cx, |workspace, _window, cx| {
-                            let client = workspace.project().read(cx).client();
-                            let history_store: Option<gpui::Entity<HistoryStore>> = workspace
-                                .panel::<AgentPanel>(cx)
-                                .map(|panel| panel.read(cx).thread_store().clone());
-                            (client, history_store)
-                        })?;
-
-                    let Some(history_store): Option<gpui::Entity<HistoryStore>> = history_store
-                    else {
-                        anyhow::bail!("Agent panel not available");
-                    };
+                    let client = workspace.update(cx, |workspace, _window, cx| {
+                        workspace.project().read(cx).client()
+                    })?;
 
                     let response = client
                         .request(proto::GetSharedAgentThread {
@@ -869,11 +859,11 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     let db_thread = shared_thread.to_db_thread();
                     let session_id = agent_client_protocol::SessionId::new(session_id);
 
-                    history_store
-                        .update(&mut cx.clone(), |store, cx| {
-                            store.save_thread(session_id.clone(), db_thread, cx)
-                        })
-                        .await?;
+                    let database_future = cx.update(|cx| ThreadsDatabase::connect(cx));
+                    let database = database_future
+                        .await
+                        .map_err(|err| anyhow::anyhow!("{err}"))?;
+                    database.save_thread(session_id.clone(), db_thread).await?;
 
                     let thread_metadata = agent::DbThreadMetadata {
                         id: session_id,
