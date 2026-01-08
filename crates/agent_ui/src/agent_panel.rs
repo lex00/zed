@@ -1132,11 +1132,7 @@ impl AgentPanel {
         self.text_history.clone().into_any_element()
     }
 
-    fn render_agent_session_recent_list(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_agent_session_recent_list(&self, cx: &mut Context<Self>) -> AnyElement {
         // Only render in agent-session mode, and only when we have a provider-backed snapshot.
         if self.navigation_mode() != NavigationMode::AgentSessions {
             return v_flex().size_full().into_any();
@@ -3339,9 +3335,9 @@ impl Render for AgentPanel {
             .children(self.render_onboarding(window, cx))
             .map(|parent| match &self.active_view {
                 ActiveView::ExternalAgentThread { thread_view, .. } => parent
+                    .child(self.render_agent_session_recent_list(cx))
                     .child(thread_view.clone())
-                    .child(self.render_drag_target(cx))
-                    .child(self.render_agent_session_recent_list(window, cx)),
+                    .child(self.render_drag_target(cx)),
                 ActiveView::HistoryAgent => parent.child(self.acp_history.clone()),
                 ActiveView::HistoryText => parent.child(self.render_text_thread_history()),
                 ActiveView::TextThread {
