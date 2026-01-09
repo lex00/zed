@@ -1,4 +1,4 @@
-use crate::agent_panel::AgentSessions;
+use crate::agent_panel::AgentSessionsModel;
 use collections::{HashMap, VecDeque};
 use editor::actions::Paste;
 use editor::code_context_menus::CodeContextMenu;
@@ -64,7 +64,7 @@ pub struct PromptEditor<T> {
     mention_set: Entity<MentionSet>,
     prompt_store: Option<Entity<PromptStore>>,
     workspace: WeakEntity<Workspace>,
-    agent_sessions: Option<AgentSessions>,
+    agent_sessions: Option<Entity<AgentSessionsModel>>,
     model_selector: Entity<AgentModelSelector>,
     edited_since_done: bool,
     prompt_history: VecDeque<String>,
@@ -1181,7 +1181,7 @@ impl InlineAssistId {
 }
 
 struct PromptEditorCompletionProviderDelegate {
-    agent_sessions: Option<AgentSessions>,
+    agent_sessions: Option<Entity<AgentSessionsModel>>,
 }
 
 fn inline_assistant_model_supports_images(cx: &App) -> bool {
@@ -1211,13 +1211,15 @@ impl PromptCompletionProviderDelegate for PromptEditorCompletionProviderDelegate
 
     fn confirm_command(&self, _cx: &mut App) {}
 
-    fn thread_entries(&self, _cx: &App) -> Vec<ThreadCompletionEntry> {
-        let Some(sessions) = &self.agent_sessions else {
+    fn thread_entries(&self, cx: &App) -> Vec<ThreadCompletionEntry> {
+        let Some(model) = &self.agent_sessions else {
             return Vec::new();
         };
-        sessions
-            .list()
-            .into_iter()
+
+        model
+            .read(cx)
+            .sessions
+            .iter()
             .map(|session| {
                 ThreadCompletionEntry::agent_session(
                     session.session_id.clone(),
@@ -1240,7 +1242,7 @@ impl PromptEditor<BufferCodegen> {
         prompt_store: Option<Entity<PromptStore>>,
         project: WeakEntity<Project>,
         workspace: WeakEntity<Workspace>,
-        agent_sessions: Option<AgentSessions>,
+        agent_sessions: Option<Entity<AgentSessionsModel>>,
         window: &mut Window,
         cx: &mut Context<PromptEditor<BufferCodegen>>,
     ) -> PromptEditor<BufferCodegen> {
@@ -1397,7 +1399,7 @@ impl PromptEditor<TerminalCodegen> {
         prompt_store: Option<Entity<PromptStore>>,
         project: WeakEntity<Project>,
         workspace: WeakEntity<Workspace>,
-        agent_sessions: Option<AgentSessions>,
+        agent_sessions: Option<Entity<AgentSessionsModel>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {

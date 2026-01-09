@@ -11,7 +11,7 @@ use crate::context::load_context;
 use crate::mention_set::MentionSet;
 use crate::{
     AgentPanel,
-    agent_panel::AgentSessions,
+    agent_panel::AgentSessionsModel,
     buffer_codegen::{BufferCodegen, CodegenAlternative, CodegenEvent},
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
@@ -503,11 +503,11 @@ impl InlineAssistant {
 
             let editor_margins = Arc::new(Mutex::new(EditorMargins::default()));
 
-            // Get shared agent sessions from AgentPanel for thread completions
-            let agent_sessions: Option<AgentSessions> = workspace
+            // Get agent sessions model from AgentPanel for thread completions
+            let agent_sessions: Option<Entity<AgentSessionsModel>> = workspace
                 .upgrade()
                 .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx))
-                .map(|panel| panel.read(cx).agent_sessions());
+                .map(|panel| panel.read(cx).agent_sessions_model());
 
             let prompt_editor = cx.new(|cx| {
                 PromptEditor::new_buffer(

@@ -3,7 +3,7 @@ use agent::NativeAgentConnection;
 use agent_client_protocol as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::AgentSettings;
-use agent_ui::AgentSessions;
+use agent_ui::{AgentKey, AgentSessionsModel};
 use anyhow::Result;
 use db::kvp::KEY_VALUE_STORE;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt};
@@ -63,7 +63,7 @@ pub struct AgentsPanel {
     agent_thread_pane: Option<Entity<AgentThreadPane>>,
     history: Entity<AcpThreadHistory>,
     agent_session_list: Option<Rc<dyn AgentSessionList>>,
-    agent_sessions: AgentSessions,
+    agent_sessions_model: Entity<AgentSessionsModel>,
     prompt_store: Option<Entity<PromptStore>>,
     fs: Arc<dyn Fs>,
     width: Option<Pixels>,
@@ -149,7 +149,7 @@ impl AgentsPanel {
             history,
             agent_session_list: None,
             prompt_store,
-            agent_sessions: AgentSessions::new(),
+            agent_sessions_model: cx.new(|cx| AgentSessionsModel::new(cx)),
             fs,
             width: None,
             pending_serialization: Task::ready(None),
@@ -199,7 +199,18 @@ impl AgentsPanel {
                 if let Some(session_list) = native_connection.session_list(cx) {
                     this.agent_session_list = Some(session_list.clone());
                     this.history.update(cx, |history, cx| {
-                        history.set_session_list(session_list, cx);
+                        history.set_session_list(session_list.clone(), cx);
+                    });
+
+                    // Keep the new model in sync so the pane can derive metadata for resume/open.
+                    this.agent_sessions_model.update(cx, |model, cx| {
+                        // v2 currently uses native agent sessions.
+                        model.set_agent(AgentKey::Native, Some(session_list), cx);
+                        model.refresh(cx);
+                    });
+                } else {
+                    this.agent_sessions_model.update(cx, |model, cx| {
+                        model.clear(cx);
                     });
                 }
             })
@@ -289,7 +300,7 @@ impl AgentsPanel {
         let workspace = self.workspace.clone();
         let project = self.project.clone();
         let prompt_store = self.prompt_store.clone();
-        let agent_sessions = self.agent_sessions.clone();
+        let agent_sessions_model = self.agent_sessions_model.clone();
 
         let agent_thread_pane = cx.new(|cx| {
             let mut pane = AgentThreadPane::new(workspace.clone(), cx);
@@ -299,7 +310,7 @@ impl AgentsPanel {
                 workspace.clone(),
                 project,
                 prompt_store,
-                agent_sessions,
+                agent_sessions_model,
                 window,
                 cx,
             );

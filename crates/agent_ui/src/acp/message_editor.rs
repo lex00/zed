@@ -1,5 +1,5 @@
 use crate::QueueMessage;
-use crate::agent_panel::AgentSessions;
+use crate::agent_panel::AgentSessionsModel;
 use crate::{
     ChatWithFollow,
     completion_provider::{
@@ -44,7 +44,7 @@ pub struct MessageEditor {
     prompt_capabilities: Rc<RefCell<acp::PromptCapabilities>>,
     available_commands: Rc<RefCell<Vec<acp::AvailableCommand>>>,
     agent_name: SharedString,
-    agent_sessions: Option<AgentSessions>,
+    agent_sessions: Option<Entity<AgentSessionsModel>>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -97,12 +97,14 @@ impl PromptCompletionProviderDelegate for Entity<MessageEditor> {
     }
 
     fn thread_entries(&self, cx: &App) -> Vec<ThreadCompletionEntry> {
-        let Some(sessions) = &self.read(cx).agent_sessions else {
+        let Some(model) = &self.read(cx).agent_sessions else {
             return Vec::new();
         };
-        sessions
-            .list()
-            .into_iter()
+
+        model
+            .read(cx)
+            .sessions
+            .iter()
             .map(|session| {
                 ThreadCompletionEntry::agent_session(
                     session.session_id.clone(),
@@ -121,7 +123,7 @@ impl MessageEditor {
         prompt_capabilities: Rc<RefCell<acp::PromptCapabilities>>,
         available_commands: Rc<RefCell<Vec<acp::AvailableCommand>>>,
         agent_name: SharedString,
-        agent_sessions: Option<AgentSessions>,
+        agent_sessions: Option<Entity<AgentSessionsModel>>,
         placeholder: &str,
         mode: EditorMode,
         window: &mut Window,

@@ -5,7 +5,7 @@ use editor::{Editor, EditorEvent};
 use fuzzy::StringMatchCandidate;
 use gpui::{
     App, BackgroundExecutor, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
-    UniformListScrollHandle, WeakEntity, Window, uniform_list,
+    UniformListScrollHandle, Window, uniform_list,
 };
 use std::{fmt::Display, ops::Range, path::Path, sync::Arc};
 use text::Bias;
@@ -17,7 +17,7 @@ use ui::{
 use util::ResultExt as _;
 
 pub struct TextThreadHistory {
-    text_thread_store: WeakEntity<TextThreadStore>,
+    text_thread_store: Entity<TextThreadStore>,
     scroll_handle: UniformListScrollHandle,
     selected_index: usize,
     hovered_index: Option<usize>,
@@ -60,7 +60,7 @@ impl EventEmitter<TextThreadHistoryEvent> for TextThreadHistory {}
 
 impl TextThreadHistory {
     pub(crate) fn new(
-        text_thread_store: WeakEntity<TextThreadStore>,
+        text_thread_store: Entity<TextThreadStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -81,6 +81,10 @@ impl TextThreadHistory {
                 }
             });
 
+        let store_subscription = cx.observe(&text_thread_store, |this, _store, cx| {
+            this.update_visible_items(true, cx);
+        });
+
         let scroll_handle = UniformListScrollHandle::default();
 
         let local_timezone =
@@ -97,7 +101,7 @@ impl TextThreadHistory {
             local_timezone,
             search_query: SharedString::default(),
             confirming_delete_history: false,
-            _subscriptions: vec![search_editor_subscription],
+            _subscriptions: vec![search_editor_subscription, store_subscription],
             _update_task: Task::ready(()),
         };
         this.update_visible_items(false, cx);
@@ -105,12 +109,12 @@ impl TextThreadHistory {
     }
 
     fn update_visible_items(&mut self, preserve_selected_item: bool, cx: &mut Context<Self>) {
-        let Some(store) = self.text_thread_store.upgrade() else {
-            return;
-        };
-
-        let mut threads: Vec<SavedTextThreadMetadata> =
-            store.read(cx).unordered_text_threads().cloned().collect();
+        let mut threads: Vec<SavedTextThreadMetadata> = self
+            .text_thread_store
+            .read(cx)
+            .unordered_text_threads()
+            .cloned()
+            .collect();
         threads.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 
         let query = self.search_query.clone();
@@ -264,12 +268,10 @@ impl TextThreadHistory {
             return;
         };
 
-        let Some(store) = self.text_thread_store.upgrade() else {
-            return;
-        };
-
         let path = entry.path.clone();
-        let delete_task = store.update(cx, |store, cx| store.delete_local(path, cx));
+        let delete_task = self
+            .text_thread_store
+            .update(cx, |store, cx| store.delete_local(path, cx));
 
         cx.spawn(async move |this, cx| {
             if let Err(err) = delete_task.await {
@@ -287,13 +289,8 @@ impl TextThreadHistory {
     }
 
     fn remove_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(store) = self.text_thread_store.upgrade() else {
-            self.confirming_delete_history = false;
-            cx.notify();
-            return;
-        };
-
-        let paths: Vec<Arc<Path>> = store
+        let paths: Vec<Arc<Path>> = self
+            .text_thread_store
             .read(cx)
             .unordered_text_threads()
             .map(|t| t.path.clone())
@@ -301,9 +298,11 @@ impl TextThreadHistory {
 
         self.confirming_delete_history = false;
 
+        let text_thread_store = self.text_thread_store.clone();
+
         cx.spawn(async move |this, cx| {
             for path in paths {
-                store
+                text_thread_store
                     .update(cx, |store, cx| store.delete_local(path, cx))
                     .await
                     .log_err();

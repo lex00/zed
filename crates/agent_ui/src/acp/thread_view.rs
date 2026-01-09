@@ -1,4 +1,4 @@
-use crate::agent_panel::AgentSessions;
+use crate::agent_panel::AgentSessionsModel;
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
     AuthRequired, LoadError, MentionUri, RetryStatus, ThreadStatus, ToolCall, ToolCallContent,
@@ -355,7 +355,7 @@ impl AcpThreadView {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         prompt_store: Option<Entity<PromptStore>>,
-        agent_sessions: AgentSessions,
+        agent_sessions_model: Entity<AgentSessionsModel>,
         track_load_event: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -379,7 +379,7 @@ impl AcpThreadView {
                 prompt_capabilities.clone(),
                 available_commands.clone(),
                 agent.name(),
-                Some(agent_sessions),
+                Some(agent_sessions_model),
                 &placeholder,
                 editor::EditorMode::AutoHeight {
                     min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
@@ -7279,7 +7279,7 @@ pub(crate) mod tests {
                     workspace.downgrade(),
                     project,
                     None,
-                    AgentSessions::new(),
+                    cx.new(|cx| AgentSessionsModel::new(cx)),
                     false,
                     window,
                     cx,
@@ -7544,7 +7544,7 @@ pub(crate) mod tests {
                     workspace.downgrade(),
                     project.clone(),
                     None,
-                    AgentSessions::new(),
+                    cx.new(|cx| AgentSessionsModel::new(cx)),
                     false,
                     window,
                     cx,

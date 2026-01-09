@@ -18,7 +18,7 @@ use ui::{
 use util::ResultExt as _;
 
 pub struct AcpThreadHistory {
-    session_list: Rc<dyn AgentSessionList>,
+    pub(crate) session_list: Rc<dyn AgentSessionList>,
     delete_supported: bool,
     delete_all_supported: bool,
     scroll_handle: UniformListScrollHandle,
@@ -120,11 +120,6 @@ impl AcpThreadHistory {
         self.delete_supported = session_list.supports_delete();
         self.delete_all_supported = session_list.delete_all_sessions(cx).is_some();
         self.session_list = session_list;
-        self.update_visible_items(true, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.update_visible_items(true, cx);
         cx.notify();
     }
@@ -507,20 +502,28 @@ fn build_bucketed_items(sessions: Vec<AgentSessionInfo>) -> Vec<ListItemType> {
     for session in sessions.into_iter() {
         let entry_bucket = if let Some(updated_at) = session.updated_at {
             let entry_date = updated_at.with_timezone(&Local).naive_local().date();
-            TimeBucket::from_dates(today, entry_date)
+            Some(TimeBucket::from_dates(today, entry_date))
         } else {
-            TimeBucket::Undated
+            None
         };
 
-        if Some(entry_bucket) != bucket {
-            bucket = Some(entry_bucket);
-            items.push(ListItemType::BucketSeparator(entry_bucket));
-        }
+        if let Some(entry_bucket) = entry_bucket {
+            if Some(entry_bucket) != bucket {
+                bucket = Some(entry_bucket);
+                items.push(ListItemType::BucketSeparator(entry_bucket));
+            }
 
-        items.push(ListItemType::Entry {
-            entry: session,
-            format: entry_bucket.into(),
-        });
+            items.push(ListItemType::Entry {
+                entry: session,
+                format: entry_bucket.into(),
+            });
+        } else {
+            // Undated sessions should not create their own bucket header; include them in the list.
+            items.push(ListItemType::Entry {
+                entry: session,
+                format: EntryTimeFormat::DateAndTime,
+            });
+        }
     }
 
     items
@@ -733,7 +736,6 @@ impl From<TimeBucket> for EntryTimeFormat {
             TimeBucket::ThisWeek => EntryTimeFormat::DateAndTime,
             TimeBucket::PastWeek => EntryTimeFormat::DateAndTime,
             TimeBucket::All => EntryTimeFormat::DateAndTime,
-            TimeBucket::Undated => EntryTimeFormat::DateAndTime,
         }
     }
 }
@@ -745,7 +747,6 @@ enum TimeBucket {
     ThisWeek,
     PastWeek,
     All,
-    Undated,
 }
 
 impl TimeBucket {
@@ -782,7 +783,6 @@ impl Display for TimeBucket {
             TimeBucket::ThisWeek => write!(f, "This Week"),
             TimeBucket::PastWeek => write!(f, "Past Week"),
             TimeBucket::All => write!(f, "All"),
-            TimeBucket::Undated => write!(f, "Other"),
         }
     }
 }
@@ -868,12 +868,12 @@ mod tests {
             "sessions missing updated_at should be rendered in bucketed view"
         );
 
-        // We should have exactly 2 bucket separators for undated + today's sessions.
+        // Undated sessions should not create their own bucket header; only today's bucket should appear.
         let bucket_separators = items
             .iter()
             .filter(|item| matches!(item, ListItemType::BucketSeparator(_)))
             .count();
-        assert_eq!(bucket_separators, 2);
+        assert_eq!(bucket_separators, 1);
 
         // And 3 entries.
         let entry_count = items
