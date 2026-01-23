@@ -1150,6 +1150,7 @@ impl Buffer {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn build_snapshot(
         text: Rope,
         language: Option<Arc<Language>>,
@@ -1289,6 +1290,7 @@ impl Buffer {
         })
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn preview_edits(
         &self,
         edits: Arc<[(Range<Anchor>, Arc<str>)]>,
@@ -1761,11 +1763,6 @@ impl Buffer {
         } else {
             return;
         };
-        log::trace!(
-            "reparse({:?},{})",
-            self.file().map(|f| f.path().as_unix_str()),
-            language.name().0.as_str()
-        );
 
         let text = self.text_snapshot();
         let parsed_version = self.version();
