@@ -1,5 +1,5 @@
 use anyhow::Result;
-use buffer_diff::BufferDiff;
+use buffer_diff::{BaseTextUpdate, BufferDiff};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
 use itertools::Itertools;
 use language::{
@@ -227,8 +227,7 @@ impl PendingDiff {
                 .update(cx, |diff, cx| {
                     diff.update_diff(
                         text_snapshot.clone(),
-                        Some(base_text.clone()),
-                        None,
+                        Some(BaseTextUpdate::Replace(base_text.clone())),
                         language,
                         cx,
                     )
@@ -399,8 +398,7 @@ async fn build_buffer_diff(
         .update(cx, |secondary_diff, cx| {
             secondary_diff.update_diff(
                 text_snapshot.clone(),
-                Some(old_text),
-                Some(false),
+                Some(BaseTextUpdate::Replace(old_text)),
                 language.clone(),
                 cx,
             )

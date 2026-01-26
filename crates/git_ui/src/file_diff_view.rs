@@ -1,7 +1,7 @@
 //! FileDiffView provides a UI for displaying differences between two buffers.
 
 use anyhow::Result;
-use buffer_diff::BufferDiff;
+use buffer_diff::{BaseTextUpdate, BufferDiff};
 use editor::{Editor, EditorEvent, MultiBuffer};
 use futures::{FutureExt, select_biased};
 use gpui::{
@@ -177,8 +177,7 @@ async fn build_buffer_diff(
         .update(cx, |diff, cx| {
             diff.update_diff(
                 new_buffer_snapshot.text.clone(),
-                Some(old_buffer_snapshot.text().into()),
-                Some(true),
+                Some(BaseTextUpdate::Edit(old_buffer_snapshot.text().into())),
                 new_buffer_snapshot.language().cloned(),
                 cx,
             )

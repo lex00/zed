@@ -13,6 +13,13 @@ use text::{
 };
 use util::ResultExt;
 
+#[derive(Clone)]
+pub enum BaseTextUpdate {
+    Clear,
+    Replace(Arc<str>),
+    Edit(Arc<str>),
+}
+
 fn translate_point_through_patch(
     patch: &Patch<Point>,
     point: Point,
@@ -1382,8 +1389,7 @@ impl BufferDiff {
         text::LineEnding::normalize(&mut base_text);
         let inner = cx.foreground_executor().block_on(this.update_diff(
             buffer.clone(),
-            Some(Arc::from(base_text)),
-            Some(false),
+            Some(BaseTextUpdate::Replace(Arc::from(base_text))),
             None,
             cx,
         ));
@@ -1485,14 +1491,24 @@ impl BufferDiff {
     pub fn update_diff(
         &self,
         buffer: text::BufferSnapshot,
-        base_text: Option<Arc<str>>,
-        base_text_change: Option<bool>,
+        base_text_update: Option<BaseTextUpdate>,
         language: Option<Arc<Language>>,
         cx: &App,
     ) -> Task<BufferDiffUpdate> {
-        let prev_base_text = self.base_text(cx).as_rope().clone();
-        let base_text_changed = base_text_change.is_some();
-        let compute_base_text_edits = base_text_change == Some(true);
+        let stored_base_text = self
+            .inner
+            .base_text_exists
+            .then(|| self.inner.base_text.read(cx).text())
+            .map(Arc::from);
+        let prev_base_text_rope = self.base_text(cx).as_rope().clone();
+
+        let (base_text, base_text_changed, compute_base_text_edits) = match base_text_update {
+            None => (stored_base_text, false, false),
+            Some(BaseTextUpdate::Clear) => (None, true, false),
+            Some(BaseTextUpdate::Replace(text)) => (Some(text), true, false),
+            Some(BaseTextUpdate::Edit(text)) => (Some(text), true, true),
+        };
+
         let diff_options = build_diff_options(
             None,
             language.as_ref().map(|l| l.name()),
@@ -1516,7 +1532,7 @@ impl BufferDiff {
                     if base_text_changed {
                         Rope::from(base_text.as_ref())
                     } else {
-                        prev_base_text
+                        prev_base_text_rope
                     }
                 } else {
                     Rope::new()
@@ -1784,7 +1800,8 @@ impl BufferDiff {
         cx.spawn(async move |this, cx| {
             let Some(state) = this
                 .update(cx, |this, cx| {
-                    this.update_diff(buffer.clone(), base_text, Some(false), language, cx)
+                    let base_text_update = base_text.map(BaseTextUpdate::Replace);
+                    this.update_diff(buffer.clone(), base_text_update, language, cx)
                 })
                 .log_err()
             else {
@@ -1812,8 +1829,7 @@ impl BufferDiff {
     #[cfg(any(test, feature = "test-support"))]
     pub fn recalculate_diff_sync(&mut self, buffer: &text::BufferSnapshot, cx: &mut Context<Self>) {
         let language = self.base_text(cx).language().cloned();
-        let base_text = self.base_text_string(cx).map(|s| s.as_str().into());
-        let fut = self.update_diff(buffer.clone(), base_text, None, language, cx);
+        let fut = self.update_diff(buffer.clone(), None, language, cx);
         let fg_executor = cx.foreground_executor().clone();
         let snapshot = fg_executor.block_on(fut);
         let fut = self.set_snapshot_with_secondary_inner(snapshot, buffer, None, false, cx);
@@ -2983,8 +2999,7 @@ mod tests {
             .update(cx, |diff, cx| {
                 diff.update_diff(
                     snapshot.clone(),
-                    Some(base_text.as_str().into()),
-                    None,
+                    Some(BaseTextUpdate::Replace(base_text.as_str().into())),
                     None,
                     cx,
                 )

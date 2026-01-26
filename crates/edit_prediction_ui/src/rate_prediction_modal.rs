@@ -1,4 +1,4 @@
-use buffer_diff::BufferDiff;
+use buffer_diff::{BaseTextUpdate, BufferDiff};
 use edit_prediction::{EditPrediction, EditPredictionRating, EditPredictionStore};
 use editor::{Editor, ExcerptRange, MultiBuffer};
 use feature_flags::FeatureFlag;
@@ -328,8 +328,7 @@ impl RatePredictionsModal {
                 diff.update(cx, |diff, cx| {
                     let update = diff.update_diff(
                         new_buffer_snapshot.text.clone(),
-                        Some(old_buffer_snapshot.text().into()),
-                        Some(true),
+                        Some(BaseTextUpdate::Edit(old_buffer_snapshot.text().into())),
                         language,
                         cx,
                     );

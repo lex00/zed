@@ -1,7 +1,7 @@
 //! TextDiffView currently provides a UI for displaying differences between the clipboard and selected text.
 
 use anyhow::Result;
-use buffer_diff::BufferDiff;
+use buffer_diff::{BaseTextUpdate, BufferDiff};
 use editor::{Editor, EditorEvent, MultiBuffer, ToPoint, actions::DiffClipboardWithSelectionData};
 use futures::{FutureExt, select_biased};
 use gpui::{
@@ -267,8 +267,7 @@ async fn update_diff_buffer(
         .update(cx, |diff, cx| {
             diff.update_diff(
                 source_buffer_snapshot.text.clone(),
-                Some(Arc::from(base_text.as_str())),
-                Some(true),
+                Some(BaseTextUpdate::Edit(Arc::from(base_text.as_str()))),
                 language.clone(),
                 cx,
             )

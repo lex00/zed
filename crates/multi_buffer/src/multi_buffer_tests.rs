@@ -1,5 +1,5 @@
 use super::*;
-use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
+use buffer_diff::{BaseTextUpdate, DiffHunkStatus, DiffHunkStatusKind};
 use gpui::{App, TestAppContext};
 use indoc::indoc;
 use language::{Buffer, Rope};
@@ -3943,8 +3943,7 @@ async fn test_singleton_with_inverted_diff(cx: &mut TestAppContext) {
         .update(cx, |diff, cx| {
             diff.update_diff(
                 buffer.read(cx).text_snapshot(),
-                Some(base_text.into()),
-                None,
+                Some(BaseTextUpdate::Replace(base_text.into())),
                 None,
                 cx,
             )
@@ -3981,8 +3980,7 @@ async fn test_singleton_with_inverted_diff(cx: &mut TestAppContext) {
         .update(cx, |diff, cx| {
             diff.update_diff(
                 buffer.read(cx).text_snapshot(),
-                Some(base_text.into()),
-                None,
+                Some(BaseTextUpdate::Replace(base_text.into())),
                 None,
                 cx,
             )
@@ -4075,8 +4073,7 @@ async fn test_inverted_diff_base_text_change(cx: &mut TestAppContext) {
         .update(cx, |diff, cx| {
             diff.update_diff(
                 buffer.read(cx).text_snapshot(),
-                Some("ddd\n".into()),
-                Some(true),
+                Some(BaseTextUpdate::Edit("ddd\n".into())),
                 None,
                 cx,
             )

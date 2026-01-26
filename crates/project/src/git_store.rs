@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use askpass::{AskPassDelegate, EncryptedPassword, IKnowWhatIAmDoingAndIHaveReadTheDocs};
-use buffer_diff::{BufferDiff, BufferDiffEvent};
+use buffer_diff::{BaseTextUpdate, BufferDiff, BufferDiffEvent};
 use client::ProjectId;
 use collections::HashMap;
 pub use conflict_set::{ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate};
@@ -111,6 +111,7 @@ struct SharedDiffs {
 struct BufferGitState {
     unstaged_diff: Option<WeakEntity<BufferDiff>>,
     uncommitted_diff: Option<WeakEntity<BufferDiff>>,
+    oid_diffs: HashMap<Option<git::Oid>, WeakEntity<BufferDiff>>,
     conflict_set: Option<WeakEntity<ConflictSet>>,
     recalculate_diff_task: Option<Task<Result<()>>>,
     reparse_conflict_markers_task: Option<Task<Result<()>>>,
@@ -132,8 +133,6 @@ struct BufferGitState {
 
     head_text: Option<Arc<str>>,
     index_text: Option<Arc<str>>,
-    head_changed: bool,
-    index_changed: bool,
     language_changed: bool,
 }
 
@@ -152,6 +151,7 @@ enum DiffBasesChange {
 enum DiffKind {
     Unstaged,
     Uncommitted,
+    SinceOid(Option<git::Oid>),
 }
 
 enum GitStoreState {
@@ -724,47 +724,105 @@ impl GitStore {
         repo: Entity<Repository>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<BufferDiff>>> {
-        cx.spawn(async move |this, cx| {
-            let buffer_snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
-            let language_registry = buffer.update(cx, |buffer, _| buffer.language_registry());
-            let content = match oid {
-                None => None,
-                Some(oid) => Some(
-                    repo.update(cx, |repo, cx| repo.load_blob_content(oid, cx))
-                        .await?,
-                ),
-            };
-            let buffer_diff = cx.new(|cx| BufferDiff::new(&buffer_snapshot, cx));
+        let buffer_id = buffer.read(cx).remote_id();
 
-            buffer_diff
-                .update(cx, |buffer_diff, cx| {
-                    buffer_diff.language_changed(
-                        buffer_snapshot.language().cloned(),
-                        language_registry,
-                        cx,
-                    );
-                    buffer_diff.set_base_text(
-                        content.map(|s| s.as_str().into()),
-                        buffer_snapshot.language().cloned(),
-                        buffer_snapshot.text,
-                        cx,
-                    )
+        if let Some(diff_state) = self.diffs.get(&buffer_id)
+            && let Some(oid_diff) = diff_state
+                .read(cx)
+                .oid_diffs
+                .get(&oid)
+                .and_then(|weak| weak.upgrade())
+        {
+            if let Some(task) =
+                diff_state.update(cx, |diff_state, _| diff_state.wait_for_recalculation())
+            {
+                return cx.background_executor().spawn(async move {
+                    task.await;
+                    Ok(oid_diff)
+                });
+            }
+            return Task::ready(Ok(oid_diff));
+        }
+
+        let diff_kind = DiffKind::SinceOid(oid);
+        let task = self
+            .loading_diffs
+            .entry((buffer_id, diff_kind))
+            .or_insert_with(|| {
+                let git_store = cx.weak_entity();
+                cx.spawn(async move |this, cx| {
+                    Self::create_oid_diff(this, git_store, oid, buffer_id, buffer, repo, cx)
+                        .await
+                        .map_err(Arc::new)
                 })
-                .await?;
-            let unstaged_diff = this
-                .update(cx, |this, cx| this.open_unstaged_diff(buffer.clone(), cx))?
-                .await?;
-            buffer_diff.update(cx, |buffer_diff, _| {
-                buffer_diff.set_secondary_diff(unstaged_diff);
+                .shared()
+            })
+            .clone();
+
+        cx.background_spawn(async move { task.await.map_err(|e| anyhow!("{e}")) })
+    }
+
+    async fn create_oid_diff(
+        this: WeakEntity<Self>,
+        git_store: WeakEntity<Self>,
+        oid: Option<git::Oid>,
+        buffer_id: BufferId,
+        buffer: Entity<Buffer>,
+        repo: Entity<Repository>,
+        cx: &mut AsyncApp,
+    ) -> Result<Entity<BufferDiff>> {
+        let buffer_snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
+        let language_registry = buffer.update(cx, |buffer, _| buffer.language_registry());
+        let content = match oid {
+            None => None,
+            Some(oid) => Some(
+                repo.update(cx, |repo, cx| repo.load_blob_content(oid, cx))
+                    .await?,
+            ),
+        };
+
+        let buffer_diff = cx.new(|cx| BufferDiff::new(&buffer_snapshot, cx));
+
+        buffer_diff
+            .update(cx, |buffer_diff, cx| {
+                buffer_diff.language_changed(
+                    buffer_snapshot.language().cloned(),
+                    language_registry,
+                    cx,
+                );
+                buffer_diff.set_base_text(
+                    content.map(|s| s.as_str().into()),
+                    buffer_snapshot.language().cloned(),
+                    buffer_snapshot.text.clone(),
+                    cx,
+                )
+            })
+            .await?;
+
+        let unstaged_diff = this
+            .update(cx, |this, cx| this.open_unstaged_diff(buffer.clone(), cx))?
+            .await?;
+        buffer_diff.update(cx, |buffer_diff, _| {
+            buffer_diff.set_secondary_diff(unstaged_diff);
+        });
+
+        let diff_kind = DiffKind::SinceOid(oid);
+        this.update(cx, |this, cx| {
+            this.loading_diffs.remove(&(buffer_id, diff_kind));
+
+            let diff_state = this
+                .diffs
+                .entry(buffer_id)
+                .or_insert_with(|| cx.new(|_| BufferGitState::new(git_store.clone())));
+            diff_state.update(cx, |diff_state, _| {
+                diff_state.oid_diffs.insert(oid, buffer_diff.downgrade());
             });
 
-            this.update(cx, |_, cx| {
-                cx.subscribe(&buffer_diff, Self::on_buffer_diff_event)
-                    .detach();
-            })?;
+            cx.subscribe(&buffer_diff, Self::on_buffer_diff_event)
+                .detach();
+        })?;
 
-            Ok(buffer_diff)
-        })
+        Ok(buffer_diff)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -876,6 +934,7 @@ impl GitStore {
                         diff.update(cx, |diff, _| diff.set_secondary_diff(unstaged_diff));
                         diff_state.uncommitted_diff = Some(diff.downgrade())
                     }
+                    DiffKind::SinceOid(_) => unreachable!(),
                 }
 
                 diff_state.diff_bases_changed(text_snapshot, Some(diff_bases_change), cx);
@@ -904,6 +963,16 @@ impl GitStore {
     ) -> Option<Entity<BufferDiff>> {
         let diff_state = self.diffs.get(&buffer_id)?;
         diff_state.read(cx).uncommitted_diff.as_ref()?.upgrade()
+    }
+
+    pub fn get_diff_since_oid(
+        &self,
+        buffer_id: BufferId,
+        oid: Option<git::Oid>,
+        cx: &App,
+    ) -> Option<Entity<BufferDiff>> {
+        let diff_state = self.diffs.get(&buffer_id)?;
+        diff_state.read(cx).oid_diffs.get(&oid)?.upgrade()
     }
 
     pub fn open_conflict_set(
@@ -1562,7 +1631,7 @@ impl GitStore {
             if let Some(diff_state) = self.diffs.get_mut(&buffer.read(cx).remote_id()) {
                 let buffer = buffer.read(cx).text_snapshot();
                 diff_state.update(cx, |diff_state, cx| {
-                    diff_state.recalculate_diffs(buffer.clone(), cx);
+                    diff_state.recalculate_diffs(buffer.clone(), None, None, cx);
                     futures.extend(diff_state.wait_for_recalculation().map(FutureExt::boxed));
                 });
                 futures.push(diff_state.update(cx, |diff_state, cx| {
@@ -2938,6 +3007,7 @@ impl BufferGitState {
         Self {
             unstaged_diff: Default::default(),
             uncommitted_diff: Default::default(),
+            oid_diffs: Default::default(),
             recalculate_diff_task: Default::default(),
             language: Default::default(),
             language_registry: Default::default(),
@@ -2946,8 +3016,6 @@ impl BufferGitState {
             hunk_staging_operation_count_as_of_write: 0,
             head_text: Default::default(),
             index_text: Default::default(),
-            head_changed: Default::default(),
-            index_changed: Default::default(),
             language_changed: Default::default(),
             conflict_updated_futures: Default::default(),
             conflict_set: Default::default(),
@@ -2959,7 +3027,7 @@ impl BufferGitState {
     fn buffer_language_changed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
         self.language = buffer.read(cx).language().cloned();
         self.language_changed = true;
-        let _ = self.recalculate_diffs(buffer.read(cx).text_snapshot(), cx);
+        let _ = self.recalculate_diffs(buffer.read(cx).text_snapshot(), None, None, cx);
     }
 
     fn reparse_conflict_markers(
@@ -3022,6 +3090,13 @@ impl BufferGitState {
         self.uncommitted_diff.as_ref().and_then(|set| set.upgrade())
     }
 
+    fn oid_diffs(&self) -> Vec<Entity<BufferDiff>> {
+        self.oid_diffs
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .collect()
+    }
+
     fn handle_base_texts_updated(
         &mut self,
         buffer: text::BufferSnapshot,
@@ -3069,61 +3144,67 @@ impl BufferGitState {
         diff_bases_change: Option<DiffBasesChange>,
         cx: &mut Context<Self>,
     ) {
-        match diff_bases_change {
-            Some(DiffBasesChange::SetIndex(index)) => {
-                self.index_text = index.map(|mut index| {
-                    text::LineEnding::normalize(&mut index);
-                    Arc::from(index.as_str())
-                });
-                self.index_changed = true;
-            }
-            Some(DiffBasesChange::SetHead(head)) => {
-                self.head_text = head.map(|mut head| {
-                    text::LineEnding::normalize(&mut head);
-                    Arc::from(head.as_str())
-                });
-                self.head_changed = true;
-            }
-            Some(DiffBasesChange::SetBoth(text)) => {
-                let text = text.map(|mut text| {
-                    text::LineEnding::normalize(&mut text);
-                    Arc::from(text.as_str())
-                });
-                self.head_text = text.clone();
-                self.index_text = text;
-                self.head_changed = true;
-                self.index_changed = true;
-            }
-            Some(DiffBasesChange::SetEach { index, head }) => {
-                self.index_text = index.map(|mut index| {
-                    text::LineEnding::normalize(&mut index);
-                    Arc::from(index.as_str())
-                });
-                self.index_changed = true;
-                self.head_text = head.map(|mut head| {
-                    text::LineEnding::normalize(&mut head);
-                    Arc::from(head.as_str())
-                });
-                self.head_changed = true;
-            }
-            None => {}
+        fn normalize(mut text: String) -> Arc<str> {
+            text::LineEnding::normalize(&mut text);
+            Arc::from(text.as_str())
         }
 
-        self.recalculate_diffs(buffer, cx)
+        fn text_to_update(text: Option<Arc<str>>) -> BaseTextUpdate {
+            match text {
+                Some(text) => BaseTextUpdate::Replace(text),
+                None => BaseTextUpdate::Clear,
+            }
+        }
+
+        let (index_change, head_change) = match diff_bases_change {
+            Some(DiffBasesChange::SetIndex(index)) => {
+                let index_text = index.map(normalize);
+                self.index_text = index_text.clone();
+                (Some(text_to_update(index_text)), None)
+            }
+            Some(DiffBasesChange::SetHead(head)) => {
+                let head_text = head.map(normalize);
+                self.head_text = head_text.clone();
+                (None, Some(text_to_update(head_text)))
+            }
+            Some(DiffBasesChange::SetBoth(text)) => {
+                let text = text.map(normalize);
+                self.head_text = text.clone();
+                self.index_text = text.clone();
+                let update = text_to_update(text);
+                (Some(update.clone()), Some(update))
+            }
+            Some(DiffBasesChange::SetEach { index, head }) => {
+                let index_text = index.map(normalize);
+                let head_text = head.map(normalize);
+                self.index_text = index_text.clone();
+                self.head_text = head_text.clone();
+                (
+                    Some(text_to_update(index_text)),
+                    Some(text_to_update(head_text)),
+                )
+            }
+            None => (None, None),
+        };
+
+        self.recalculate_diffs(buffer, index_change, head_change, cx)
     }
 
     #[ztracing::instrument(skip_all)]
-    fn recalculate_diffs(&mut self, buffer: text::BufferSnapshot, cx: &mut Context<Self>) {
+    fn recalculate_diffs(
+        &mut self,
+        buffer: text::BufferSnapshot,
+        index_change: Option<BaseTextUpdate>,
+        head_change: Option<BaseTextUpdate>,
+        cx: &mut Context<Self>,
+    ) {
         *self.recalculating_tx.borrow_mut() = true;
 
         let language = self.language.clone();
         let language_registry = self.language_registry.clone();
         let unstaged_diff = self.unstaged_diff();
         let uncommitted_diff = self.uncommitted_diff();
-        let head = self.head_text.clone();
-        let index = self.index_text.clone();
-        let index_changed = self.index_changed;
-        let head_changed = self.head_changed;
+        let oid_diffs = self.oid_diffs();
         let language_changed = self.language_changed;
         let prev_hunk_staging_operation_count = self.hunk_staging_operation_count_as_of_write;
         let index_matches_head = match (self.index_text.as_ref(), self.head_text.as_ref()) {
@@ -3131,6 +3212,12 @@ impl BufferGitState {
             (None, None) => true,
             _ => false,
         };
+
+        let head_change = head_change.map(|update| match update {
+            BaseTextUpdate::Replace(text) => BaseTextUpdate::Edit(text),
+            other => other,
+        });
+
         self.recalculate_diff_task = Some(cx.spawn(async move |this, cx| {
             log::debug!(
                 "start recalculating diffs for buffer {}",
@@ -3143,8 +3230,7 @@ impl BufferGitState {
                     cx.update(|cx| {
                         unstaged_diff.read(cx).update_diff(
                             buffer.clone(),
-                            index,
-                            index_changed.then_some(false),
+                            index_change,
                             language.clone(),
                             cx,
                         )
@@ -3153,8 +3239,6 @@ impl BufferGitState {
                 );
             }
 
-            // Dropping BufferDiff can be expensive, so yield back to the event loop
-            // for a bit
             yield_now().await;
 
             let mut new_uncommitted_diff = None;
@@ -3166,8 +3250,7 @@ impl BufferGitState {
                         cx.update(|cx| {
                             uncommitted_diff.read(cx).update_diff(
                                 buffer.clone(),
-                                head,
-                                head_changed.then_some(true),
+                                head_change,
                                 language.clone(),
                                 cx,
                             )
@@ -3228,12 +3311,44 @@ impl BufferGitState {
                 uncommitted_diff
                     .update(cx, |diff, cx| {
                         if language_changed {
-                            diff.language_changed(language, language_registry, cx);
+                            diff.language_changed(
+                                language.clone(),
+                                language_registry.clone(),
+                                cx,
+                            );
                         }
                         diff.set_snapshot_with_secondary(
                             new_uncommitted_diff,
                             &buffer,
-                            unstaged_changed_range.flatten(),
+                            unstaged_changed_range.clone().flatten(),
+                            true,
+                            cx,
+                        )
+                    })
+                    .await;
+            }
+
+            for oid_diff in oid_diffs {
+                let new_oid_diff = cx
+                    .update(|cx| {
+                        oid_diff
+                            .read(cx)
+                            .update_diff(buffer.clone(), None, language.clone(), cx)
+                    })
+                    .await;
+                oid_diff
+                    .update(cx, |diff, cx| {
+                        if language_changed {
+                            diff.language_changed(
+                                language.clone(),
+                                language_registry.clone(),
+                                cx,
+                            );
+                        }
+                        diff.set_snapshot_with_secondary(
+                            new_oid_diff,
+                            &buffer,
+                            unstaged_changed_range.clone().flatten(),
                             true,
                             cx,
                         )
@@ -3248,8 +3363,6 @@ impl BufferGitState {
 
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, _| {
-                    this.index_changed = false;
-                    this.head_changed = false;
                     this.language_changed = false;
                     *this.recalculating_tx.borrow_mut() = false;
                 });

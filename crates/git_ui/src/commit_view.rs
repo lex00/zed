@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use buffer_diff::BufferDiff;
+use buffer_diff::{BaseTextUpdate, BufferDiff};
 use collections::HashMap;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle};
 use editor::{Addon, Editor, EditorEvent, ExcerptRange, MultiBuffer, multibuffer_context_lines};
@@ -879,15 +879,12 @@ async fn build_buffer_diff(
 
     let diff = cx.new(|cx| BufferDiff::new(&buffer.text, cx));
 
+    let base_text_update = old_text
+        .map(|old_text| BaseTextUpdate::Edit(Arc::from(old_text.as_str())))
+        .or(Some(BaseTextUpdate::Clear));
     let update = diff
         .update(cx, |diff, cx| {
-            diff.update_diff(
-                buffer.text.clone(),
-                old_text.map(|old_text| Arc::from(old_text.as_str())),
-                Some(true),
-                language.clone(),
-                cx,
-            )
+            diff.update_diff(buffer.text.clone(), base_text_update, language.clone(), cx)
         })
         .await;
 

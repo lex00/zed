@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use buffer_diff::BufferDiff;
+use buffer_diff::{BaseTextUpdate, BufferDiff};
 use clock;
 use collections::BTreeMap;
 use futures::{FutureExt, StreamExt, channel::mpsc};
@@ -407,8 +407,7 @@ impl ActionLog {
             .update(cx, |diff, cx| {
                 diff.update_diff(
                     buffer_snapshot.clone(),
-                    Some(new_base_text),
-                    Some(true),
+                    Some(BaseTextUpdate::Edit(new_base_text)),
                     language,
                     cx,
                 )
