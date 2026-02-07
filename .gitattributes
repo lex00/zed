@@ -3,3 +3,6 @@
 
 # Ensure the WSL script always has LF line endings, even on Windows
 crates/zed/resources/windows/zed.sh text eol=lf
+
+# Chant spec files use a custom merge driver for intelligent conflict resolution
+.chant/specs/*.md merge=chant-spec
