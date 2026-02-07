@@ -12268,3 +12268,104 @@ async fn test_buffer_reload_after_rapid_delete_and_recreate(cx: &mut gpui::TestA
         );
     });
 }
+
+#[gpui::test]
+async fn test_buffer_reload_after_real_fs_delete_and_recreate(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Two-batch scenario: delete, wait for events, then recreate
+    std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should still have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Deleted),
+            "buffer should be Deleted after file removal, got {:?}",
+            file.disk_state()
+        );
+    });
+
+    std::fs::write(dir.path().join("file.txt"), "new content after recreate").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after recreate, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "new content after recreate",
+            "buffer content should match the recreated file (RealFs two-batch)"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_real_fs_rapid_delete_and_recreate(
+    cx: &mut gpui::TestAppContext,
+) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Single-batch scenario: delete and immediately recreate, then flush
+    std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+    std::fs::write(dir.path().join("file.txt"), "rapidly replaced content").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after rapid delete+recreate, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "rapidly replaced content",
+            "buffer content should match the recreated file (RealFs single-batch)"
+        );
+    });
+}
