@@ -2947,3 +2947,75 @@ async fn test_refresh_entries_for_paths_creates_ancestors(cx: &mut TestAppContex
         );
     });
 }
+
+#[gpui::test]
+async fn test_issue_38109_dir_delete_recreate(cx: &mut TestAppContext) {
+    // Tests for issue #38109: stale watcher registration on directory delete/recreate.
+    // The bug occurs on Linux where FsWatcher maintains a registrations map and returns early
+    // if a path is already registered. When a directory is deleted, worktree calls remove_path()
+    // but doesn't call watcher.remove(), leaving a stale entry in FsWatcher.registrations.
+    // When the directory is recreated, watcher.add() returns early because the stale entry
+    // still exists, leaving the directory unwatched.
+    //
+    // NOTE: On macOS, FSEvents uses recursive watches at the parent level, so the stale
+    // per-directory registration issue doesn't manifest. This test is valid for regression
+    // testing on all platforms, but will only fail on Linux where the bug exists.
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "subdir": {
+            "original.txt": "content"
+        }
+    }));
+
+    let tree = Worktree::local(
+        dir.path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.flush_fs_events(cx).await;
+
+    // Step 1: Verify initial state
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("subdir")).is_some());
+        assert!(tree.entry_for_path(rel_path("subdir/original.txt")).is_some());
+    });
+
+    // Step 2: Delete the subdirectory using std::fs (simulating external tool)
+    std::fs::remove_dir_all(dir.path().join("subdir")).unwrap();
+    tree.flush_fs_events(cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("subdir")).is_none(),
+            "subdir should be gone after deletion"
+        );
+    });
+
+    // Step 3: Recreate the same directory with a NEW file
+    std::fs::create_dir(dir.path().join("subdir")).unwrap();
+    std::fs::write(dir.path().join("subdir/new_file.txt"), "new content").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    // Step 4: This assertion would FAIL on current main on Linux due to stale registration
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("subdir")).is_some(),
+            "subdir should be visible after recreate"
+        );
+        assert!(
+            tree.entry_for_path(rel_path("subdir/new_file.txt")).is_some(),
+            "new_file.txt should be visible in recreated subdir"
+        );
+    });
+}
