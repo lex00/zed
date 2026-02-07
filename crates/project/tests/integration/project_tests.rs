@@ -14183,3 +14183,383 @@ async fn test_buffer_after_file_delete_recreate_same_mtime(cx: &mut gpui::TestAp
     });
 }
 
+// Tests for #38109: rename + dirty buffer angle
+//
+// These test two mechanisms that can cause buffer staleness:
+// 1. External rename with content change (simulating what `claude` does when refactoring)
+// 2. Dirty buffer suppressing ReloadNeeded with no retry when buffer becomes clean
+
+#[gpui::test]
+async fn test_buffer_after_external_rename_with_content_change(cx: &mut gpui::TestAppContext) {
+    // When an external tool renames a file AND changes its content simultaneously
+    // (e.g. delete old + create new with different content), the buffer that was
+    // open at the old path should track to the new path and reload with new content.
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            "old_name.txt": "original content",
+            "other.txt": "unrelated",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/old_name.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+        assert!(!buffer.is_dirty());
+    });
+
+    // Simulate what an external tool does: delete old file, create new file with different content.
+    // This is a rename + content change — the inode changes, so entry_id won't match.
+    fs.remove_file(path!("/dir/old_name.txt").as_ref(), Default::default())
+        .await
+        .unwrap();
+    fs.save(
+        path!("/dir/new_name.txt").as_ref(),
+        &"completely rewritten content".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+
+    // The buffer was tracking old_name.txt which is now deleted.
+    // It should transition to Deleted state.
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Deleted),
+            "buffer should see old file as Deleted, got {:?}",
+            file.disk_state()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_after_rename_preserving_inode(cx: &mut gpui::TestAppContext) {
+    // When a file is renamed (same inode, via fs.rename), the open buffer should
+    // track to the new path and remain clean.
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            "before.txt": "some content",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    let tree_id = tree.update(cx, |tree, _| tree.id());
+    let buffer = project
+        .update(cx, |p, cx| p.open_buffer((tree_id, rel_path("before.txt")), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "some content");
+        assert!(!buffer.is_dirty());
+    });
+
+    // Rename via fs.rename (preserves inode in FakeFs)
+    fs.rename(
+        path!("/dir/before.txt").as_ref(),
+        path!("/dir/after.txt").as_ref(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+
+    // Buffer should track to the new path
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert_eq!(
+            &**file.path(),
+            "after.txt",
+            "buffer should track renamed file to new path"
+        );
+        assert!(!buffer.is_dirty(), "buffer should not be dirty after rename");
+        assert_eq!(buffer.text(), "some content");
+    });
+}
+
+#[gpui::test]
+async fn test_dirty_buffer_misses_reload_after_external_write(cx: &mut gpui::TestAppContext) {
+    // When a file changes on disk while the buffer has unsaved edits, the buffer
+    // suppresses ReloadNeeded. After the user undoes their edit (making the buffer
+    // clean), the buffer should ideally reload from disk — but currently it doesn't
+    // because there's no retry mechanism.
+    //
+    // This test documents the current behavior (which may be a bug contributing to #38109).
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            "file.txt": "version 1",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "version 1");
+        assert!(!buffer.is_dirty());
+    });
+
+    // User makes an edit, making the buffer dirty
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "user edit: ")], None, cx);
+    });
+
+    buffer.read_with(cx, |buffer, _| {
+        assert!(buffer.is_dirty());
+        assert_eq!(buffer.text(), "user edit: version 1");
+    });
+
+    // External tool writes new content while buffer is dirty.
+    // The file_updated path will see disk state change but suppress ReloadNeeded
+    // because buffer.is_dirty() is true.
+    fs.save(
+        path!("/dir/file.txt").as_ref(),
+        &"version 2 from external tool".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+
+    // Buffer should detect the conflict
+    buffer.read_with(cx, |buffer, _| {
+        assert!(
+            buffer.has_conflict(),
+            "buffer should have conflict when dirty and disk changed"
+        );
+        assert_eq!(
+            buffer.text(),
+            "user edit: version 1",
+            "buffer should keep user's edits while conflicted"
+        );
+    });
+
+    // User undoes their edit, making the buffer "clean" relative to its saved version.
+    // But the saved version is version 1, while disk now has version 2.
+    buffer.update(cx, |buffer, cx| {
+        buffer.undo(cx);
+    });
+    cx.executor().run_until_parked();
+
+    // After undo, the buffer text matches saved_version (version 1), so is_dirty() is false.
+    // But the disk has version 2. The buffer is stale but doesn't know it needs to reload.
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "disk state should be Present, got {:?}",
+            file.disk_state()
+        );
+        // This documents the current behavior: after undo, the buffer has version 1
+        // but disk has version 2. The buffer is stale.
+        // A fix would detect that disk mtime > saved_mtime and trigger a reload.
+        let disk_mtime = file.disk_state().mtime();
+        let buffer_is_stale = buffer.text() != "version 2 from external tool";
+        if buffer_is_stale {
+            // Current behavior: buffer stays at version 1 after undo.
+            // This is the bug — no ReloadNeeded was emitted because buffer was dirty
+            // when the disk change happened, and there's no retry when it becomes clean.
+            assert_eq!(buffer.text(), "version 1");
+            assert!(
+                !buffer.is_dirty(),
+                "buffer should not be dirty after undo to saved version"
+            );
+            // The mtime mismatch proves staleness
+            assert_ne!(
+                buffer.saved_mtime(),
+                disk_mtime,
+                "saved_mtime should differ from disk mtime, proving buffer is stale"
+            );
+        } else {
+            // If this branch executes, the bug has been fixed!
+            assert_eq!(buffer.text(), "version 2 from external tool");
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_during_truncate_then_write(cx: &mut gpui::TestAppContext) {
+    // Reproduces the truncate-then-write race condition from #38109.
+    //
+    // When an AI agent (Claude Code, Cursor, etc.) writes a file, the typical
+    // pattern is File::create() (which truncates to 0 bytes) followed by write_all().
+    // If Zed's scanner processes the truncation event before the write completes,
+    // the buffer reloads to empty and may become permanently stuck.
+    //
+    // We reproduce this deterministically on a real filesystem by:
+    // 1. Truncating the file to empty
+    // 2. Forcing scanner to process (flush_fs_events) → buffer reloads to empty
+    // 3. Writing new content but resetting mtime to match the truncated file's mtime
+    // 4. Flushing again → scanner sees same mtime → no update → buffer stuck empty
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content that should not be lost",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content that should not be lost");
+        assert!(!buffer.is_dirty());
+    });
+
+    let file_path = dir.path().join("file.txt");
+
+    // Step 1: Truncate the file to empty (simulating the first half of an agent write).
+    // An AI agent's File::create() does exactly this — opens with O_TRUNC.
+    std::fs::write(&file_path, "").unwrap();
+
+    // Capture the mtime of the truncated (empty) file.
+    let truncated_mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+    // Step 2: Force the scanner to process this truncation event.
+    // This simulates the race where FSEvents delivers the truncation before the write.
+    tree.flush_fs_events(cx).await;
+
+    // The buffer should now be empty — it reloaded the 0-byte file.
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "",
+            "buffer should be empty after reloading truncated file"
+        );
+    });
+
+    // Step 3: Write the actual content (the second half of the agent write).
+    std::fs::write(&file_path, "new content from AI agent").unwrap();
+
+    // Step 4: Reset the file's mtime to match the truncated file's mtime.
+    // This simulates the scenario where both the truncation and write happen
+    // within the same mtime granularity (same timestamp). On a busy system with
+    // coarse-grained timestamps, or when the OS doesn't update mtime for rapid
+    // writes, this is how the race manifests.
+    let times = std::fs::FileTimes::new().set_modified(truncated_mtime);
+    let file_handle = std::fs::File::options()
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+    file_handle.set_times(times).unwrap();
+    drop(file_handle);
+
+    // Step 5: Force scanner to process the write event.
+    tree.flush_fs_events(cx).await;
+
+    // THE BUG: The scanner re-stats the file and sees the same mtime as the
+    // truncated version. Since old_state == new_state in file_updated(),
+    // no ReloadNeeded is emitted. The buffer is permanently stuck empty even
+    // though the file now has content on disk.
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "disk state should be Present, got {:?}",
+            file.disk_state()
+        );
+
+        // This assertion documents the bug: buffer is empty but file has content.
+        // When the bug is fixed, this test should be updated to assert the buffer
+        // contains "new content from AI agent".
+        assert_eq!(
+            buffer.text(),
+            "",
+            "BUG #38109: buffer is permanently stuck empty after truncate-then-write \
+             race with same mtime. The file on disk has content but the buffer never \
+             reloaded because file_updated() saw no mtime change."
+        );
+
+        // Verify the file actually has content on disk — proving the buffer is stale.
+        let disk_content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(disk_content, "new content from AI agent");
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_recovers_from_truncate_when_mtime_differs(cx: &mut gpui::TestAppContext) {
+    // Control test for test_buffer_reload_during_truncate_then_write.
+    // Same truncate-then-write sequence, but WITHOUT resetting the mtime.
+    // With distinct mtimes (which APFS nanosecond precision provides), the
+    // scanner detects the change and the buffer recovers.
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    let file_path = dir.path().join("file.txt");
+
+    // Truncate
+    std::fs::write(&file_path, "").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "", "buffer should be empty after truncation");
+    });
+
+    // Write new content (mtime will naturally differ on APFS)
+    std::fs::write(&file_path, "recovered content").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    // With a different mtime, the scanner detects the change and triggers reload.
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "recovered content",
+            "buffer should recover when mtime differs after truncate-then-write"
+        );
+    });
+}
+
