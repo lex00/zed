@@ -12148,3 +12148,123 @@ mod disable_ai_settings_tests {
         });
     }
 }
+
+#[gpui::test]
+async fn test_buffer_reload_after_external_delete_and_recreate(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            "file.txt": "original content",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file.txt"), cx))
+        .await
+        .unwrap();
+
+    // Verify initial state
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Step 1: Delete the file externally
+    fs.remove_file(path!("/dir/file.txt").as_ref(), Default::default())
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    // Verify buffer transitions to deleted state
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should still have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Deleted),
+            "buffer should be in Deleted state after file removal, got {:?}",
+            file.disk_state()
+        );
+    });
+
+    // Step 2: Recreate the file with different content
+    fs.save(
+        path!("/dir/file.txt").as_ref(),
+        &"new content after recreate".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+
+    // Step 3: THIS IS THE KEY ASSERTION - buffer should have the new content
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be in Present state after recreate, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "new content after recreate",
+            "buffer content should match the recreated file content"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_rapid_delete_and_recreate(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            "file.txt": "original content",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Delete and immediately recreate WITHOUT processing events in between.
+    // This simulates git checkout or other tools that rapidly replace files.
+    fs.remove_file(path!("/dir/file.txt").as_ref(), Default::default())
+        .await
+        .unwrap();
+    fs.save(
+        path!("/dir/file.txt").as_ref(),
+        &"rapidly replaced content".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    // NOW process events (both delete and recreate in same batch)
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after rapid delete+recreate, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "rapidly replaced content",
+            "buffer should have the new content after rapid delete+recreate"
+        );
+    });
+}
