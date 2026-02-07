@@ -95,7 +95,10 @@ impl Watcher for FsWatcher {
                         EventKind::Create(_) => Some(PathEventKind::Created),
                         EventKind::Modify(_) => Some(PathEventKind::Changed),
                         EventKind::Remove(_) => Some(PathEventKind::Removed),
-                        _ => None,
+                        // EventKind::Other includes OS rescan signals (e.g. macOS
+                        // MustScanSubDirs after FSEvents queue overflow). Treat as
+                        // Changed so process_events() re-stats the path from disk.
+                        _ => Some(PathEventKind::Changed),
                     };
                     let mut path_events = event
                         .paths

@@ -3927,7 +3927,7 @@ impl BackgroundScanner {
                     while let Poll::Ready(Some(more_paths)) = futures::poll!(fs_events_rx.next()) {
                         paths.extend(more_paths);
                     }
-                    self.process_events(paths.into_iter().filter(|e| e.kind.is_some()).map(Into::into).collect()).await;
+                    self.process_events(paths.into_iter().map(Into::into).collect()).await;
                 }
 
                 _ = global_gitignore_events.next().fuse() => {

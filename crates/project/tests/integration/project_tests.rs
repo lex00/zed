@@ -12369,3 +12369,1817 @@ async fn test_buffer_reload_after_real_fs_rapid_delete_and_recreate(
         );
     });
 }
+
+#[gpui::test]
+async fn test_buffer_reload_after_git_branch_switch(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main branch",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_commit("initial commit on main", &repo);
+
+    // Create "other" branch with different file content
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("other", &head, false).unwrap();
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git checkout other failed");
+
+    std::fs::write(dir.path().join("file.txt"), "content on other branch").unwrap();
+    git_add(Path::new("file.txt"), &repo);
+    git_commit("change on other branch", &repo);
+
+    // Switch back to main
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git checkout main failed");
+
+    // Open the project and buffer on main
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main branch");
+    });
+
+    // Simulate chant's merge_and_cleanup: rapid branch switch away and back
+    // main → other (file content changes) → main (file content restored)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "rapid checkout to other failed");
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "rapid checkout back to main failed");
+
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after branch round-trip, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content on main branch",
+            "buffer should have correct content after rapid branch switch round-trip"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_git_branch_switch_file_deleted(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main branch",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit on main", &repo);
+
+    // Create "other" branch where file.txt is deleted.
+    // Use CLI for all operations to avoid libgit2/CLI HEAD desync.
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["rm", "file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "delete file.txt on other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Switch back to main (file.txt exists again)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify file exists on disk with correct content after setup
+    let disk_content = std::fs::read_to_string(dir.path().join("file.txt")).unwrap();
+    assert_eq!(disk_content, "content on main branch", "file on disk after setup");
+
+    // Open project and buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main branch");
+    });
+
+    // Rapid switch: main → other (file.txt DELETED) → main (file.txt RECREATED)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after branch round-trip with file deletion, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content on main branch",
+            "buffer should have correct content after branch switch that deletes and recreates file"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_git_branch_switch_file_deleted_two_batch(
+    cx: &mut gpui::TestAppContext,
+) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main branch",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit on main", &repo);
+
+    // Create "other" branch where file.txt is deleted (all CLI to avoid desync)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["rm", "file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "delete file.txt on other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main branch");
+    });
+
+    // Two-batch: checkout "other" (file.txt DELETED), flush, then checkout "main" (RECREATED)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Let Zed process the deletion
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should still have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Deleted),
+            "buffer should be Deleted after checkout to branch without file, got {:?}",
+            file.disk_state()
+        );
+    });
+
+    // Now checkout main (file.txt recreated on disk)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after checkout back to main, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content on main branch",
+            "buffer should reload content after file deletion and recreation via branch switch"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_dirty_buffer_after_git_branch_switch_file_deleted(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main branch",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit on main", &repo);
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["rm", "file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "delete file.txt on other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main branch");
+    });
+
+    // User makes an edit (buffer becomes dirty)
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "user edit: ")], None, cx);
+    });
+
+    buffer.read_with(cx, |buffer, _| {
+        assert!(buffer.is_dirty(), "buffer should be dirty after edit");
+        assert_eq!(buffer.text(), "user edit: content on main branch");
+    });
+
+    // Branch switch: main → other (file.txt DELETED) → main (file.txt RECREATED)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    tree.flush_fs_events(cx).await;
+
+    // After deletion, buffer should still have user edits (dirty prevents reload)
+    buffer.read_with(cx, |buffer, _| {
+        assert!(buffer.is_dirty(), "buffer should still be dirty");
+        assert_eq!(
+            buffer.text(),
+            "user edit: content on main branch",
+            "dirty buffer should preserve user edits during file deletion"
+        );
+    });
+
+    // Switch back to main (file.txt recreated)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    tree.flush_fs_events(cx).await;
+
+    // After recreation, buffer should still have user edits AND be in conflict
+    // (dirty buffer with changed disk state)
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "file should be Present after checkout back to main, got {:?}",
+            file.disk_state()
+        );
+        // Buffer should still have user's edits preserved
+        assert_eq!(
+            buffer.text(),
+            "user edit: content on main branch",
+            "dirty buffer should preserve user edits through branch switch round-trip"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_git_branch_switch_many_files(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    // Create a repo with many files that differ between branches.
+    // This simulates chant switching between a feature branch and main
+    // where many files have diverged.
+    let mut tree_json = serde_json::Map::new();
+    tree_json.insert(
+        "target.txt".to_string(),
+        serde_json::Value::String("target file on main".to_string()),
+    );
+    for i in 0..50 {
+        tree_json.insert(
+            format!("file_{i:03}.txt"),
+            serde_json::Value::String(format!("main content {i}")),
+        );
+    }
+
+    let dir = TempTree::new(serde_json::Value::Object(tree_json));
+
+    let repo = git_init(dir.path());
+
+    // Add all files
+    let output = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    git_commit("initial commit with many files", &repo);
+
+    // Create "other" branch with different content for all files
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Modify all files on "other" branch, and delete target.txt
+    for i in 0..50 {
+        std::fs::write(
+            dir.path().join(format!("file_{i:03}.txt")),
+            format!("other branch content {i}"),
+        )
+        .unwrap();
+    }
+    std::fs::remove_file(dir.path().join("target.txt")).unwrap();
+
+    let output = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "modify all files and delete target on other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Switch back to main
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Open project and the target buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("target.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "target file on main");
+    });
+
+    // Rapid branch switch with 50+ files changing: main → other → main
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "checkout to other failed");
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "checkout back to main failed");
+
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after many-file branch switch, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "target file on main",
+            "buffer should have correct content after rapid branch switch with many files changing"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_after_git_checkout_to_branch_without_file(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    // Branch "main" has file.txt; branch "other" does not.
+    // Set up entirely via CLI to avoid libgit2/CLI HEAD desync.
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main",
+        "keep.txt": "anchor",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial", &repo);
+
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run(&["checkout", "-b", "other"]);
+    run(&["rm", "file.txt"]);
+    run(&["commit", "-m", "remove file.txt"]);
+    run(&["checkout", "main"]);
+
+    // Open project while on "main" — file.txt exists
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main");
+    });
+
+    // Switch directly to "other" — file.txt is deleted by git
+    run(&["checkout", "other"]);
+    assert!(
+        !dir.path().join("file.txt").exists(),
+        "file.txt should be gone on disk after checkout"
+    );
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should still have a file reference");
+        assert!(
+            matches!(file.disk_state(), DiskState::Deleted),
+            "buffer should transition to Deleted when git removes the file, got {:?}",
+            file.disk_state()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_external_write(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // External process (like Claude Code) overwrites the file
+    std::fs::write(dir.path().join("file.txt"), "content written by external tool").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after external write, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content written by external tool",
+            "buffer should reload after external file write"
+        );
+    });
+
+    // Second rapid write (within same second — tests mtime precision)
+    std::fs::write(dir.path().join("file.txt"), "second write by external tool").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "second write by external tool",
+            "buffer should reload after rapid second external write"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_dirty_buffer_after_external_write(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // User makes an edit in Zed
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "user: ")], None, cx);
+    });
+
+    buffer.read_with(cx, |buffer, _| {
+        assert!(buffer.is_dirty());
+        assert_eq!(buffer.text(), "user: original content");
+    });
+
+    // External tool writes to the same file while buffer is dirty
+    std::fs::write(dir.path().join("file.txt"), "external tool overwrote").unwrap();
+    tree.flush_fs_events(cx).await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        // File should be Present (it was overwritten, not deleted)
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "disk state should be Present, got {:?}",
+            file.disk_state()
+        );
+        // Buffer should have conflict (dirty + disk changed)
+        assert!(
+            buffer.has_conflict(),
+            "buffer should have conflict when dirty and disk changed"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_external_write_real_timing(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    // Wait for initial scan to complete (use real timing, not flush_fs_events)
+    cx.background_executor
+        .timer(Duration::from_millis(500))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // External write — then wait for real FS event delivery (100ms latency + processing)
+    std::fs::write(dir.path().join("file.txt"), "externally written content").unwrap();
+
+    // Wait enough time for FSEvents (100ms latency) + scanner processing + buffer reload
+    cx.background_executor
+        .timer(Duration::from_millis(1000))
+        .await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "externally written content",
+            "buffer should have reloaded after external write (real timing)"
+        );
+    });
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_buffer_reload_rapid_external_writes(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "v0",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_millis(500))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "v0");
+    });
+
+    // Simulate Claude Code doing multiple rapid edits (like Edit tool called several times)
+    for i in 1..=5 {
+        std::fs::write(dir.path().join("file.txt"), format!("v{i}")).unwrap();
+        // Small delay between edits (simulates Claude Code processing between tool calls)
+        cx.background_executor
+            .timer(Duration::from_millis(50))
+            .await;
+    }
+
+    // Wait for all events to settle
+    cx.background_executor
+        .timer(Duration::from_millis(2000))
+        .await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after rapid writes, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "v5",
+            "buffer should have final content after rapid external writes"
+        );
+    });
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_buffer_reload_truncate_then_write(cx: &mut gpui::TestAppContext) {
+    use std::io::Write;
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content here",
+    }));
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_millis(500))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content here");
+    });
+
+    // Simulate a write that truncates first, then writes after a delay.
+    // This is what happens with open(O_TRUNC) followed by write().
+    {
+        let file_path = dir.path().join("file.txt");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&file_path)
+            .unwrap();
+        // File is now empty on disk. If scanner reads NOW, it sees empty content.
+        // Small delay to give FSEvents a chance to fire
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        file.write_all(b"new content after truncate").unwrap();
+        file.flush().unwrap();
+    }
+
+    // Wait for events to settle
+    cx.background_executor
+        .timer(Duration::from_millis(2000))
+        .await;
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "new content after truncate",
+            "buffer should have final content, not empty from truncate window"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_reload_after_git_branch_switch_no_flush(cx: &mut gpui::TestAppContext) {
+    use worktree::WorktreeModelHandle as _;
+
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let mut tree_json = serde_json::Map::new();
+    tree_json.insert(
+        "target.txt".to_string(),
+        serde_json::Value::String("target file on main".to_string()),
+    );
+    for i in 0..50 {
+        tree_json.insert(
+            format!("file_{i:03}.txt"),
+            serde_json::Value::String(format!("main content {i}")),
+        );
+    }
+
+    let dir = TempTree::new(serde_json::Value::Object(tree_json));
+
+    let repo = git_init(dir.path());
+    let output = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    git_commit("initial commit with many files", &repo);
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    for i in 0..50 {
+        std::fs::write(
+            dir.path().join(format!("file_{i:03}.txt")),
+            format!("other branch content {i}"),
+        )
+        .unwrap();
+    }
+    std::fs::remove_file(dir.path().join("target.txt")).unwrap();
+
+    let output = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "modify all files and delete target on other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("target.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "target file on main");
+    });
+
+    // Rapid branch switch without flush_fs_events between — rely on real FSEvents timing
+    let output = std::process::Command::new("git")
+        .args(["checkout", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Wait for real FSEvents to be delivered and processed (no sentinel file trick)
+    // FSEvents debounce is 100ms, so 2 seconds should be more than enough
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after branch switch (no flush), got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "target file on main",
+            "buffer should have correct content after rapid branch switch (no flush, real timing)"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_after_git_worktree_remove(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_commit("initial commit", &repo);
+
+    // Create a git worktree BEFORE opening the project (like chant does)
+    let worktree_dir = dir.path().parent().unwrap().join("test-worktree");
+    let output = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "spec-branch",
+            &worktree_dir.to_string_lossy(),
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Modify the file in the worktree and commit
+    std::fs::write(worktree_dir.join("file.txt"), "modified in worktree").unwrap();
+    let output = std::process::Command::new("git")
+        .args(["add", "file.txt"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "worktree change"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Open the project (main worktree) and a buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main");
+    });
+
+    // Remove the worktree (like chant does after merge)
+    // This modifies .git/worktrees/ in the main repo
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", &worktree_dir.to_string_lossy()])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git worktree remove failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Use flush_fs_events with timeout to detect hangs
+    use worktree::WorktreeModelHandle as _;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    let timeout = cx.background_executor.timer(Duration::from_secs(15));
+    futures::select_biased! {
+        _ = futures::FutureExt::fuse(tree.flush_fs_events(cx)) => {}
+        _ = futures::FutureExt::fuse(timeout) => {
+            panic!("flush_fs_events hung for 15s after git worktree remove!");
+        }
+    }
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should still be Present after worktree remove, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content on main",
+            "buffer should still have correct content after git worktree remove"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_after_git_worktree_remove_and_merge(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_commit("initial commit", &repo);
+
+    // Create worktree, modify file, commit (like a chant agent)
+    let worktree_dir = dir.path().parent().unwrap().join("test-worktree-merge");
+    let output = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "spec-branch",
+            &worktree_dir.to_string_lossy(),
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    std::fs::write(worktree_dir.join("file.txt"), "modified by agent").unwrap();
+    let output = std::process::Command::new("git")
+        .args(["add", "file.txt"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "agent change"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Open project and buffer BEFORE the merge
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main");
+    });
+
+    // Simulate chant's merge_and_cleanup:
+    // 1. Remove worktree (modifies .git/worktrees/)
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", &worktree_dir.to_string_lossy()])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // 2. Merge the branch (file.txt content changes on disk)
+    let output = std::process::Command::new("git")
+        .args(["merge", "--ff-only", "spec-branch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 3. Delete the branch
+    let output = std::process::Command::new("git")
+        .args(["branch", "-d", "spec-branch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Wait for FSEvents + scanner + buffer reload
+    use worktree::WorktreeModelHandle as _;
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    // After merge, the buffer should have the agent's content
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after worktree remove + merge, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "modified by agent",
+            "buffer should have updated content after worktree remove and ff-merge"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_buffer_after_git_branch_delete_file_and_switch_back(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main branch",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit on main", &repo);
+
+    // Create "del-branch" where file.txt is deleted
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "del-branch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["rm", "file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "delete file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Switch back to main for project setup
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Open project and buffer on main
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main branch");
+    });
+
+    // Step 1: Switch to del-branch (file.txt gets DELETED)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "del-branch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Wait for scanner to process the deletion in its own batch
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    // Verify file is actually deleted on disk
+    assert!(
+        !dir.path().join("file.txt").exists(),
+        "file.txt should not exist on del-branch"
+    );
+
+    // Verify buffer knows file is deleted
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert_eq!(
+            file.disk_state(),
+            DiskState::Deleted,
+            "buffer should be Deleted after switching to branch where file was removed"
+        );
+    });
+
+    // Step 2: Switch back to main (file.txt gets RESTORED)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify file is back on disk
+    let disk_content = std::fs::read_to_string(dir.path().join("file.txt")).unwrap();
+    assert_eq!(disk_content, "content on main branch");
+
+    // Wait for scanner to process the restoration
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    // This is the critical assertion: buffer should have content again
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after switching back to main, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content on main branch",
+            "buffer should have correct content after delete-on-branch then switch back to main"
+        );
+    });
+}
+
+/// Test: file content changes but mtime is FORCED to stay the same.
+/// This tests whether the reload mechanism detects content changes
+/// when the only signal is via mtime comparison.
+#[gpui::test]
+async fn test_buffer_content_change_same_mtime(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_commit("initial commit", &repo);
+
+    // Open project and buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Record the original mtime
+    let original_metadata = std::fs::metadata(dir.path().join("file.txt")).unwrap();
+    let original_mtime = original_metadata.modified().unwrap();
+    let mtime_duration = original_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let mtime_ns = mtime_duration.as_secs() as i128 * 1_000_000_000
+        + mtime_duration.subsec_nanos() as i128;
+
+    // Write DIFFERENT content, then reset mtime to original
+    std::fs::write(dir.path().join("file.txt"), "CHANGED content").unwrap();
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import os; os.utime('{}', ns=({}, {}))",
+                dir.path().join("file.txt").display(),
+                mtime_ns,
+                mtime_ns
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify the mtime is really the same
+    let new_mtime = std::fs::metadata(dir.path().join("file.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(original_mtime, new_mtime, "mtime should be unchanged");
+
+    // Wait for scanner to process the event
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    // With same mtime, DiskState comparison won't detect a change.
+    // This test documents the CURRENT behavior — the buffer will NOT update.
+    buffer.read_with(cx, |buffer, _| {
+        // This is the EXPECTED behavior with current implementation:
+        // buffer does NOT reload because mtime unchanged means DiskState unchanged
+        let text = buffer.text();
+        if text == "original content" {
+            // Buffer didn't update — this is the current behavior.
+            // The DiskState only tracks mtime, so same mtime = no reload.
+            eprintln!(
+                "CONFIRMED: buffer does NOT reload when content changes with same mtime. \
+                This is the suspected root cause of issue #38109."
+            );
+        } else if text == "CHANGED content" {
+            // Buffer DID update — unexpected, but good
+            eprintln!("Buffer DID reload despite same mtime — good!");
+        } else {
+            panic!("Unexpected buffer content: {:?}", text);
+        }
+    });
+
+    // Now touch the file (change mtime) — this SHOULD trigger a reload
+    let output = std::process::Command::new("touch")
+        .arg(dir.path().join("file.txt"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Wait for scanner
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "CHANGED content",
+            "after touch (which changes mtime), buffer SHOULD reload with new content"
+        );
+    });
+}
+
+/// Test: git checkout to a branch where file is deleted, then back to main.
+/// Uses same-mtime to test if the buffer reloads even when git restores
+/// the file with the original timestamp.
+#[gpui::test]
+async fn test_buffer_after_git_branch_switch_file_deleted_same_mtime(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "content on main branch",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit on main", &repo);
+
+    // Record original mtime
+    let original_mtime = std::fs::metadata(dir.path().join("file.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mtime_duration = original_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let mtime_ns = mtime_duration.as_secs() as i128 * 1_000_000_000
+        + mtime_duration.subsec_nanos() as i128;
+
+    // Create "del-branch" where file.txt is deleted
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", "del-branch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["rm", "file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", "delete file.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Switch back to main
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Force the restored file's mtime back to the ORIGINAL mtime
+    // This simulates what might happen on HFS+ or when git preserves timestamps
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import os; os.utime('{}', ns=({}, {}))",
+                dir.path().join("file.txt").display(),
+                mtime_ns,
+                mtime_ns
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Open project and buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on main branch");
+    });
+
+    // Switch to del-branch (file deleted) then IMMEDIATELY back to main (file restored)
+    let output = std::process::Command::new("git")
+        .args(["checkout", "del-branch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = std::process::Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Force mtime back to original (simulating same-mtime restoration)
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import os; os.utime('{}', ns=({}, {}))",
+                dir.path().join("file.txt").display(),
+                mtime_ns,
+                mtime_ns
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Wait for scanner
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after branch round-trip, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "content on main branch",
+            "buffer should have correct content after branch switch with same-mtime restoration"
+        );
+    });
+}
+
+/// Test: file is deleted (scanner processes deletion in one batch), then restored
+/// with SAME mtime (scanner processes restoration in a second batch).
+/// The Deleted→Present transition should trigger ReloadNeeded regardless of mtime.
+#[gpui::test]
+async fn test_buffer_delete_then_restore_same_mtime_two_batch(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit", &repo);
+
+    // Record original mtime
+    let original_mtime = std::fs::metadata(dir.path().join("file.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mtime_duration = original_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let mtime_ns = mtime_duration.as_secs() as i128 * 1_000_000_000
+        + mtime_duration.subsec_nanos() as i128;
+
+    // Open project and buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Step 1: DELETE the file
+    std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+
+    // Wait for scanner to process deletion in its own batch
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert_eq!(
+            file.disk_state(),
+            DiskState::Deleted,
+            "buffer should be Deleted after file removal"
+        );
+    });
+
+    // Step 2: RESTORE the file with DIFFERENT content but SAME mtime as original
+    std::fs::write(dir.path().join("file.txt"), "RESTORED content").unwrap();
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import os; os.utime('{}', ns=({}, {}))",
+                dir.path().join("file.txt").display(),
+                mtime_ns,
+                mtime_ns
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Wait for scanner to process restoration in its own batch
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    // Deleted→Present transition should ALWAYS trigger ReloadNeeded, even with same mtime
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after file restoration, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "RESTORED content",
+            "buffer should have new content after delete+restore (two-batch, same mtime)"
+        );
+    });
+}
+
+/// Test that verifies buffer reloads when a file is deleted and restored with the same mtime.
+/// This simulates what might happen if the filesystem has coarse timestamp resolution
+/// or if git somehow preserves the original mtime.
+#[gpui::test]
+async fn test_buffer_after_file_delete_recreate_same_mtime(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let dir = TempTree::new(json!({
+        "file.txt": "original content",
+        "keep.txt": "anchor file",
+    }));
+
+    let repo = git_init(dir.path());
+    git_add(Path::new("file.txt"), &repo);
+    git_add(Path::new("keep.txt"), &repo);
+    git_commit("initial commit", &repo);
+
+    // Record the file's original mtime
+    let original_mtime = std::fs::metadata(dir.path().join("file.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // Open project and buffer
+    let project =
+        Project::test(Arc::new(RealFs::new(None, cx.executor())), [dir.path()], cx).await;
+
+    cx.background_executor
+        .timer(Duration::from_secs(1))
+        .await;
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(dir.path().join("file.txt"), cx))
+        .await
+        .unwrap();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "original content");
+    });
+
+    // Delete the file
+    std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+
+    // Wait for scanner to process deletion
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert_eq!(
+            file.disk_state(),
+            DiskState::Deleted,
+            "buffer should be Deleted after file removal"
+        );
+    });
+
+    // Recreate the file with DIFFERENT content but SAME mtime
+    std::fs::write(dir.path().join("file.txt"), "new content after recreation").unwrap();
+
+    // Force the mtime back to the original value with nanosecond precision
+    let mtime_duration = original_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let mtime_ns = mtime_duration.as_secs() as i128 * 1_000_000_000
+        + mtime_duration.subsec_nanos() as i128;
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import os; os.utime('{}', ns=({}, {}))",
+                dir.path().join("file.txt").display(),
+                mtime_ns,
+                mtime_ns
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to set mtime: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify mtime was set correctly
+    let new_mtime = std::fs::metadata(dir.path().join("file.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        original_mtime, new_mtime,
+        "mtime should match original after forced reset"
+    );
+
+    // Wait for scanner to process restoration
+    cx.background_executor
+        .timer(Duration::from_secs(2))
+        .await;
+    cx.executor().run_until_parked();
+
+    // Critical: buffer should have the NEW content, not be stuck as empty or old
+    buffer.read_with(cx, |buffer, _| {
+        let file = buffer.file().expect("buffer should have a file");
+        assert!(
+            matches!(file.disk_state(), DiskState::Present { .. }),
+            "buffer should be Present after file recreation, got {:?}",
+            file.disk_state()
+        );
+        assert_eq!(
+            buffer.text(),
+            "new content after recreation",
+            "buffer should have new content even when mtime is same as original"
+        );
+    });
+}
+
