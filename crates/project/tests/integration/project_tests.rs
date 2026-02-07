@@ -14481,10 +14481,9 @@ async fn test_buffer_reload_during_truncate_then_write(cx: &mut gpui::TestAppCon
     // Step 5: Force scanner to process the write event.
     tree.flush_fs_events(cx).await;
 
-    // THE BUG: The scanner re-stats the file and sees the same mtime as the
-    // truncated version. Since old_state == new_state in file_updated(),
-    // no ReloadNeeded is emitted. The buffer is permanently stuck empty even
-    // though the file now has content on disk.
+    // With the fix (size in DiskState::Present), the scanner sees the file size
+    // changed from 0 to 25 bytes even though mtime is the same. This triggers
+    // ReloadNeeded and the buffer recovers.
     buffer.read_with(cx, |buffer, _| {
         let file = buffer.file().expect("buffer should have a file");
         assert!(
@@ -14493,20 +14492,12 @@ async fn test_buffer_reload_during_truncate_then_write(cx: &mut gpui::TestAppCon
             file.disk_state()
         );
 
-        // This assertion documents the bug: buffer is empty but file has content.
-        // When the bug is fixed, this test should be updated to assert the buffer
-        // contains "new content from AI agent".
         assert_eq!(
             buffer.text(),
-            "",
-            "BUG #38109: buffer is permanently stuck empty after truncate-then-write \
-             race with same mtime. The file on disk has content but the buffer never \
-             reloaded because file_updated() saw no mtime change."
+            "new content from AI agent",
+            "buffer should recover after truncate-then-write even with same mtime, \
+             because DiskState::Present now includes file size"
         );
-
-        // Verify the file actually has content on disk — proving the buffer is stale.
-        let disk_content = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(disk_content, "new content from AI agent");
     });
 }
 
